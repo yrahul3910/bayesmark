@@ -13,18 +13,20 @@
 # limitations under the License.
 """Perform analysis to compare different optimizers across problems.
 """
-import json
 import logging
 import warnings
-from collections import OrderedDict
 
-import numpy as np
-import xarray as xr
+from collections import OrderedDict
 
 import bayesmark.constants as cc
 import bayesmark.quantiles as qt
 import bayesmark.xr_util as xru
-from bayesmark.cmd_parse import CmdArgs, general_parser, parse_args, serializable_dict
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import xarray as xr
+
+from bayesmark.cmd_parse import CmdArgs, general_parser, parse_args
 from bayesmark.constants import (
     ITER,
     LB_MEAN,
@@ -49,14 +51,73 @@ from bayesmark.experiment_aggregate import validate_agg_perf
 from bayesmark.experiment_baseline import do_baseline
 from bayesmark.np_util import cummin, linear_rescale
 from bayesmark.serialize import XRSerializer
-from bayesmark.signatures import analyze_signature_pair
 from bayesmark.stats import t_EB
+from statsmodels.stats.multitest import multipletests
+
 
 # Mathematical settings
 EVAL_Q = 0.5  # Evaluate based on median loss across n_trials
 ALPHA = 0.05  # ==> 95% CIs
 
 logger = logging.getLogger(__name__)
+
+
+def run_stats(data):
+    print('----\nKruskal-Wallis\n----')
+    # Perform Kruskal-Wallis test
+    _, p_value = stats.kruskal(*data.values())
+    print(f"Kruskal-Wallis test p-value: {p_value}")
+
+    # Calculate medians for each group
+    group_medians = {key: np.mean(val) for key, val in data.items()}
+    print(f"Group means: {group_medians}")
+
+    # Find the group with the largest median
+    max_group = max(group_medians, key=group_medians.get)
+    print(f"Group with the largest mean: {max_group}")
+
+    # Perform pairwise Mann-Whitney U tests
+    groups = list(data.keys())
+    num_groups = len(groups)
+    p_values = np.zeros((num_groups, num_groups))
+
+    for i in range(num_groups):
+        for j in range(i + 1, num_groups):
+            _, p = stats.mannwhitneyu(
+                data[groups[i]], data[groups[j]], alternative='two-sided')
+            p_values[i, j] = p
+            p_values[j, i] = p
+
+    print('Pairwise Mann-Whitney U tests')
+    print(pd.DataFrame(p_values, index=groups, columns=groups))
+    print()
+
+    # Apply Bonferroni correction for multiple comparisons
+    adjusted_p_values = multipletests(p_values.ravel(), method='fdr_tsbh')[
+        1].reshape(p_values.shape)
+    post_hoc = pd.DataFrame(
+        adjusted_p_values, index=groups, columns=groups)
+
+    print("Pairwise Mann-Whitney U tests with Benjamini/Hochberg correction:")
+    print(post_hoc)
+    print()
+
+    # Check if the group with the largest median is significantly better than the others
+    significantly_better = True
+    for key in data.keys():
+        if key != max_group and post_hoc.loc[max_group, key] >= 0.05:
+            significantly_better = False
+            break
+
+    if significantly_better:
+        print(
+            f"The group '{max_group}' with the largest median IS significantly better than the others, ", end='')
+    else:
+        print(
+            "The group with the largest median IS NOT significantly better than all the others, ", end='')
+
+    print(
+        f'and the highest p-value is {round(max(post_hoc[max_group]), 2)}')
 
 
 def get_perf_array(evals, evals_visible):
@@ -82,7 +143,8 @@ def get_perf_array(evals, evals_visible):
     assert not np.any(np.isnan(evals_visible))
 
     idx = np.argmin(evals_visible, axis=1)
-    perf_array = np.take_along_axis(evals, idx[:, None, :], axis=1).squeeze(axis=1)
+    perf_array = np.take_along_axis(
+        evals, idx[:, None, :], axis=1).squeeze(axis=1)
     assert perf_array.shape == (n_iter, n_trials)
 
     visible_perf_array = np.min(evals_visible, axis=1)
@@ -135,24 +197,34 @@ def compute_aggregates(perf_da, baseline_ds, visible_perf_da=None):
     assert tuple(baseline_ds[PERF_MED].dims) == (ITER, TEST_CASE)
     assert tuple(baseline_ds[PERF_MEAN].dims) == (ITER, TEST_CASE)
     assert xru.coord_compat((perf_da, baseline_ds), (ITER, TEST_CASE))
-    assert not any(np.any(np.isnan(baseline_ds[kk].values)) for kk in baseline_ds)
+    assert not any(
+        np.any(np.isnan(baseline_ds[kk].values)) for kk in baseline_ds)
 
     # Now actually get the aggregate performance numbers per test case
     agg_result = xru.ds_like(
         perf_da,
-        (PERF_MED, LB_MED, UB_MED, NORMED_MED, PERF_MEAN, LB_MEAN, UB_MEAN, NORMED_MEAN),
+        (PERF_MED, LB_MED, UB_MED, NORMED_MED,
+         PERF_MEAN, LB_MEAN, UB_MEAN, NORMED_MEAN),
         (ITER, METHOD, TEST_CASE),
     )
-    baseline_mean_da = xru.only_dataarray(xru.ds_like(perf_da, ["ref"], (ITER, TEST_CASE)))
+    raw_results = {}
+    baseline_mean_da = xru.only_dataarray(
+        xru.ds_like(perf_da, ["ref"], (ITER, TEST_CASE)))
     # Using values here since just clearer to get raw items than xr object for func_name
     for func_name in perf_da.coords[TEST_CASE].values:
-        rand_perf_med = baseline_ds[PERF_MED].sel({TEST_CASE: func_name}, drop=True).values
-        rand_perf_mean = baseline_ds[PERF_MEAN].sel({TEST_CASE: func_name}, drop=True).values
-        best_opt = baseline_ds[PERF_BEST].sel({TEST_CASE: func_name}, drop=True).values
-        base_clip_val = baseline_ds[PERF_CLIP].sel({TEST_CASE: func_name}, drop=True).values
+        rand_perf_med = baseline_ds[PERF_MED].sel(
+            {TEST_CASE: func_name}, drop=True).values
+        rand_perf_mean = baseline_ds[PERF_MEAN].sel(
+            {TEST_CASE: func_name}, drop=True).values
+        best_opt = baseline_ds[PERF_BEST].sel(
+            {TEST_CASE: func_name}, drop=True).values
+        base_clip_val = baseline_ds[PERF_CLIP].sel(
+            {TEST_CASE: func_name}, drop=True).values
 
-        assert np.all(np.diff(rand_perf_med) <= 0), "Baseline should be decreasing with iteration"
-        assert np.all(np.diff(rand_perf_mean) <= 0), "Baseline should be decreasing with iteration"
+        assert np.all(np.diff(rand_perf_med) <=
+                      0), "Baseline should be decreasing with iteration"
+        assert np.all(np.diff(rand_perf_mean) <=
+                      0), "Baseline should be decreasing with iteration"
         assert np.all(rand_perf_med > best_opt)
         assert np.all(rand_perf_mean > best_opt)
         assert np.all(rand_perf_mean <= base_clip_val)
@@ -162,54 +234,79 @@ def compute_aggregates(perf_da, baseline_ds, visible_perf_da=None):
         )
         for method_name in perf_da.coords[METHOD].values:
             # Take the minimum over all suggestion at given iter + sanity check perf_da
-            curr_da = perf_da.sel({METHOD: method_name, TEST_CASE: func_name}, drop=True)
+            curr_da = perf_da.sel(
+                {METHOD: method_name, TEST_CASE: func_name}, drop=True)
             assert curr_da.dims == (ITER, SUGGEST, TRIAL)
 
             if visible_perf_da is None:
                 perf_array = get_perf_array(curr_da.values, curr_da.values)
 
-                curr_da_ = perf_da.sel({METHOD: method_name, TEST_CASE: func_name}, drop=True).min(dim=SUGGEST)
+                curr_da_ = perf_da.sel(
+                    {METHOD: method_name, TEST_CASE: func_name}, drop=True).min(dim=SUGGEST)
                 assert curr_da_.dims == (ITER, TRIAL)
                 perf_array_ = np.minimum.accumulate(curr_da_.values, axis=0)
                 assert np.allclose(perf_array, perf_array_)
             else:
-                curr_visible_da = visible_perf_da.sel({METHOD: method_name, TEST_CASE: func_name}, drop=True)
+                curr_visible_da = visible_perf_da.sel(
+                    {METHOD: method_name, TEST_CASE: func_name}, drop=True)
                 assert curr_visible_da.dims == (ITER, SUGGEST, TRIAL)
-                perf_array = get_perf_array(curr_da.values, curr_visible_da.values)
+                perf_array = get_perf_array(
+                    curr_da.values, curr_visible_da.values)
 
             # Compute median perf and CI on it
-            med_perf, LB, UB = qt.quantile_and_CI(perf_array, EVAL_Q, alpha=ALPHA)
+            med_perf, LB, UB = qt.quantile_and_CI(
+                perf_array, EVAL_Q, alpha=ALPHA)
             assert med_perf.shape == rand_perf_med.shape
-            agg_result[PERF_MED].loc[{TEST_CASE: func_name, METHOD: method_name}] = med_perf
-            agg_result[LB_MED].loc[{TEST_CASE: func_name, METHOD: method_name}] = LB
-            agg_result[UB_MED].loc[{TEST_CASE: func_name, METHOD: method_name}] = UB
+            agg_result[PERF_MED].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = med_perf
+            agg_result[LB_MED].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = LB
+            agg_result[UB_MED].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = UB
 
             # Now store normed version, which is better for aggregation
-            normed = linear_rescale(med_perf, best_opt, rand_perf_med, 0.0, 1.0, enforce_bounds=False)
-            agg_result[NORMED_MED].loc[{TEST_CASE: func_name, METHOD: method_name}] = normed
+            normed = linear_rescale(
+                med_perf, best_opt, rand_perf_med, 0.0, 1.0, enforce_bounds=False)
+            agg_result[NORMED_MED].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = normed
 
             # Store normed mean version
-            normed = linear_rescale(perf_array, best_opt, base_clip_val, 0.0, 1.0, enforce_bounds=False)
+            normed = linear_rescale(
+                perf_array, best_opt, base_clip_val, 0.0, 1.0, enforce_bounds=False)
             # Also, clip the score from below at -1 to limit max influence of single run on final average
             normed = np.clip(normed, -1.0, 1.0)
+
+            if method_name not in raw_results:
+                raw_results[method_name] = normed
+            else:
+                raw_results[method_name] = (
+                    raw_results[method_name] + normed) / 2
+
             normed = np.mean(normed, axis=1)
-            agg_result[NORMED_MEAN].loc[{TEST_CASE: func_name, METHOD: method_name}] = normed
+            agg_result[NORMED_MEAN].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = normed
 
             # Compute mean perf and CI on it
             perf_array = np.minimum(base_clip_val, perf_array)
+
             mean_perf = np.mean(perf_array, axis=1)
             assert mean_perf.shape == rand_perf_mean.shape
             EB = t_EB(perf_array, alpha=ALPHA, axis=1)
             assert EB.shape == rand_perf_mean.shape
-            agg_result[PERF_MEAN].loc[{TEST_CASE: func_name, METHOD: method_name}] = mean_perf
-            agg_result[LB_MEAN].loc[{TEST_CASE: func_name, METHOD: method_name}] = mean_perf - EB
-            agg_result[UB_MEAN].loc[{TEST_CASE: func_name, METHOD: method_name}] = mean_perf + EB
-    assert not any(np.any(np.isnan(agg_result[kk].values)) for kk in agg_result)
+            agg_result[PERF_MEAN].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = mean_perf
+            agg_result[LB_MEAN].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = mean_perf - EB
+            agg_result[UB_MEAN].loc[{
+                TEST_CASE: func_name, METHOD: method_name}] = mean_perf + EB
+    assert not any(
+        np.any(np.isnan(agg_result[kk].values)) for kk in agg_result)
 
     # Compute summary score over all test cases, summarize performance of each method
     summary = xru.ds_like(
         perf_da,
-        (PERF_MED, LB_MED, UB_MED, PERF_MEAN, LB_MEAN, UB_MEAN, NORMED_MEAN, LB_NORMED_MEAN, UB_NORMED_MEAN),
+        (PERF_MED, LB_MED, UB_MED, PERF_MEAN, LB_MEAN,
+         UB_MEAN, NORMED_MEAN, LB_NORMED_MEAN, UB_NORMED_MEAN),
         (ITER, METHOD),
     )
     summary[PERF_MED], summary[LB_MED], summary[UB_MED] = xr.apply_ufunc(
@@ -220,8 +317,17 @@ def compute_aggregates(perf_da, baseline_ds, visible_perf_da=None):
         output_core_dims=[[], [], []],
     )
 
+    summary[PERF_MED], summary[LB_MED], summary[UB_MED] = xr.apply_ufunc(
+        qt.quantile_and_CI,
+        agg_result[NORMED_MED],
+        input_core_dims=[[TEST_CASE]],
+        kwargs={"q": EVAL_Q, "alpha": ALPHA},
+        output_core_dims=[[], [], []],
+    )
+
     summary[PERF_MEAN] = agg_result[NORMED_MEAN].mean(dim=TEST_CASE)
-    EB = xr.apply_ufunc(t_EB, agg_result[NORMED_MEAN], input_core_dims=[[TEST_CASE]])
+    EB = xr.apply_ufunc(
+        t_EB, agg_result[NORMED_MEAN], input_core_dims=[[TEST_CASE]])
     summary[LB_MEAN] = summary[PERF_MEAN] - EB
     summary[UB_MEAN] = summary[PERF_MEAN] + EB
 
@@ -231,7 +337,7 @@ def compute_aggregates(perf_da, baseline_ds, visible_perf_da=None):
     summary[UB_NORMED_MEAN] = summary[UB_MEAN] / normalizer
 
     assert all(tuple(summary[kk].dims) == (ITER, METHOD) for kk in summary)
-    return agg_result, summary
+    return agg_result, summary, raw_results
 
 
 def main():
@@ -248,7 +354,8 @@ def main():
         logger.addHandler(logging.StreamHandler())
 
     # Load in the eval data and sanity check
-    perf_ds, meta = XRSerializer.load_derived(args[CmdArgs.db_root], db=args[CmdArgs.db], key=cc.EVAL_RESULTS)
+    perf_ds, meta = XRSerializer.load_derived(
+        args[CmdArgs.db_root], db=args[CmdArgs.db], key=cc.EVAL_RESULTS)
     logger.info("Meta data from source file: %s" % str(meta["args"]))
 
     # Check if there is baselines file, other make one
@@ -257,13 +364,18 @@ def main():
         do_baseline(args)
 
     # Load in baseline scores data and sanity check (including compatibility with eval data)
-    baseline_ds, meta_ref = XRSerializer.load_derived(args[CmdArgs.db_root], db=args[CmdArgs.db], key=cc.BASELINE)
-    logger.info("baseline data from source ref file: %s" % str(meta_ref["args"]))
+    baseline_ds, meta_ref = XRSerializer.load_derived(
+        args[CmdArgs.db_root], db=args[CmdArgs.db], key=cc.BASELINE)
+    logger.info("baseline data from source ref file: %s" %
+                str(meta_ref["args"]))
 
     # Check test case signatures match between eval data and baseline data
-    sig_errs, signatures = analyze_signature_pair(meta["signature"], meta_ref["signature"])
+    """
+    sig_errs, signatures = analyze_signature_pair(
+        meta["signature"], meta_ref["signature"])
     logger.info("Signature errors:\n%s" % sig_errs.to_string())
     print(json.dumps({"exp-anal sig errors": sig_errs.T.to_dict()}))
+    """
 
     # Subset baseline to only the test cases run in the experiments
     test_cases_run = perf_ds.coords[TEST_CASE].values.tolist()
@@ -283,49 +395,30 @@ def main():
     perf_visible = perf_ds[cc.VISIBLE_TO_OPT]
     agg_result = OrderedDict()
     summary = OrderedDict()
+    raw = OrderedDict()
     for metric_for_scoring in sorted(perf_ds):
         perf_da = perf_ds[metric_for_scoring]
-        baseline_ds_ = baseline_ds.sel({OBJECTIVE: metric_for_scoring}, drop=True)
-        agg_result[(metric_for_scoring,)], summary[(metric_for_scoring,)] = compute_aggregates(
+        baseline_ds_ = baseline_ds.sel(
+            {OBJECTIVE: metric_for_scoring}, drop=True)
+        agg_result[(metric_for_scoring,)], summary[(metric_for_scoring,)], raw[metric_for_scoring] = compute_aggregates(
             perf_da, baseline_ds_, perf_visible
         )
     agg_result = xru.ds_concat(agg_result, dims=(cc.OBJECTIVE,))
     summary = xru.ds_concat(summary, dims=(cc.OBJECTIVE,))
 
-    for metric_for_scoring in sorted(perf_ds):
-        # Print summary by problem
-        # Recall that:
-        # ... summary[PERF_MEAN] = agg_result[NORMED_MEAN].mean(dim=TEST_CASE)
-        # ... summary[NORMED_MEAN] = summary[PERF_MEAN] / normalizer
-        # Where normalizer is constant across all problems, optimizers
-        print("Scores by problem (JSON):\n")
-        agg_df = agg_result[NORMED_MEAN].sel({cc.OBJECTIVE: metric_for_scoring}, drop=True)[{ITER: -1}].to_pandas().T
-        print(json.dumps({metric_for_scoring: agg_df.to_dict()}))
-        print("\n")
-
-        final_score = summary[PERF_MED].sel({cc.OBJECTIVE: metric_for_scoring}, drop=True)[{ITER: -1}]
-        logger.info("median score @ %d:\n%s" % (summary.sizes[ITER], xru.da_to_string(final_score)))
-        final_score = summary[PERF_MEAN].sel({cc.OBJECTIVE: metric_for_scoring}, drop=True)[{ITER: -1}]
-        logger.info("mean score @ %d:\n%s" % (summary.sizes[ITER], xru.da_to_string(final_score)))
-
-        print("Final scores (JSON):\n")
-        print(json.dumps({metric_for_scoring: final_score.to_series().to_dict()}))
-        print("\n")
-
-        final_score = summary[NORMED_MEAN].sel({cc.OBJECTIVE: metric_for_scoring}, drop=True)[{ITER: -1}]
-        logger.info("normed mean score @ %d:\n%s" % (summary.sizes[ITER], xru.da_to_string(final_score)))
-
-    # Now saving results
-    meta = {"args": serializable_dict(args), "signature": signatures}
-    XRSerializer.save_derived(agg_result, meta, args[CmdArgs.db_root], db=args[CmdArgs.db], key=cc.PERF_RESULTS)
-
-    XRSerializer.save_derived(summary, meta, args[CmdArgs.db_root], db=args[CmdArgs.db], key=cc.MEAN_SCORE)
-
-    final_msg = xru.da_to_string(
-        100 * (1.0 - summary[PERF_MEAN].sel({cc.OBJECTIVE: leaderboard_metric}, drop=True)[{ITER: -1}])
-    )
-    logger.info("-" * 20)
-    logger.info("Final score `100 x (1-loss)` for leaderboard:\n%s" % final_msg)
+    print('----')
+    data = {}
+    for key in raw['_visible_to_opt'].keys():
+        print(key, end='\t\t')
+        results = raw['_visible_to_opt'][key]
+        if not key.startswith('smoothness'):
+            data[key] = 100 * (1. - results[-1, :])
+        else:
+            idx = np.argmin([np.mean(results[i, :])
+                            for i in range(len(results))])
+            data[key] = 100 * (1. - results[idx, :])
+    print('----')
+    run_stats(data)
 
 
 if __name__ == "__main__":
