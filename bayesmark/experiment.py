@@ -18,15 +18,14 @@ import logging
 import random as pyrandom
 import uuid
 import warnings
+
 from collections import OrderedDict
 from time import sleep, time
-
-import numpy as np
-import xarray as xr
 
 import bayesmark.cmd_parse as cmd
 import bayesmark.constants as cc
 import bayesmark.random_search as rs
+
 from bayesmark.builtin_opt.config import CONFIG
 from bayesmark.cmd_parse import CmdArgs
 from bayesmark.constants import ARG_DELIM, ITER, OBJECTIVE, SUGGEST
@@ -37,6 +36,10 @@ from bayesmark.signatures import analyze_signature_pair, get_func_signature
 from bayesmark.sklearn_funcs import SklearnModel, SklearnSurrogate
 from bayesmark.space import JointSpace
 from bayesmark.util import chomp, str_join_safe
+
+import numpy as np
+import xarray as xr
+
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +358,8 @@ def build_suggest_ds(suggest_log):
         :class:`xarray:xarray.Dataset` containing one variable for each input with the objective function evaluations.
         It has dimensions ``(ITER, SUGGEST)``.
     """
-    n_call, n_suggest = np.shape(suggest_log)
+    n_call = len(suggest_log)
+    n_suggest = len(suggest_log[0])
     assert n_call * n_suggest > 0
 
     # Setup the dims
@@ -547,6 +551,7 @@ def experiment_main(opt_class, args=None):  # pragma: main
     # Curate results into clean dataframes
     eval_ds = build_eval_ds(function_evals, OBJECTIVE_NAMES)
     time_ds = build_timing_ds(*timing)
+    print(f"{suggest_log = }")
     suggest_ds = build_suggest_ds(suggest_log)
 
     # setup meta:

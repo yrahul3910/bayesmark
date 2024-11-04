@@ -15,13 +15,14 @@
 """
 from enum import IntEnum, auto
 
-import numpy as np
-import pandas as pd  # only needed for csv reader, maybe try something else
-from sklearn import datasets
-
 from bayesmark.constants import DATA_LOADER_NAMES, SCORERS_CLF, SCORERS_REG
 from bayesmark.path_util import join_safe_r
 from bayesmark.stats import robust_standardize
+
+import numpy as np
+import pandas as pd  # only needed for csv reader, maybe try something else
+
+from sklearn import datasets
 
 
 class ProblemType(IntEnum):
@@ -37,7 +38,6 @@ DATA_LOADERS = {
     "iris": (datasets.load_iris, ProblemType.clf),
     "wine": (datasets.load_wine, ProblemType.clf),
     "breast": (datasets.load_breast_cancer, ProblemType.clf),
-    "boston": (datasets.load_boston, ProblemType.reg),
     "diabetes": (datasets.load_diabetes, ProblemType.reg),
 }
 

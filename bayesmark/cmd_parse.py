@@ -21,17 +21,20 @@ import json
 import os.path
 import sys
 import uuid as pyuuid
+
 from enum import IntEnum, auto
 from pathlib import PosixPath
-
-import git
-from git.exc import InvalidGitRepositoryError
-from pathvalidate.argparse import sanitize_filename, validate_filename, validate_filepath
 
 from bayesmark.builtin_opt.config import CONFIG
 from bayesmark.constants import ARG_DELIM, DATA_LOADER_NAMES, METRICS, MODEL_NAMES, OPTIMIZERS_FILE, PY_INTERPRETER
 from bayesmark.path_util import absopen, abspath
 from bayesmark.util import shell_join
+
+import git
+
+from git.exc import InvalidGitRepositoryError
+from pathvalidate.argparse import sanitize_filename, validate_filename, validate_filepath
+
 
 assert not any(ARG_DELIM in opt for opt in MODEL_NAMES)
 assert not any(ARG_DELIM in opt for opt in DATA_LOADER_NAMES)
@@ -86,8 +89,7 @@ CMD_STR = {
 
 def arg_to_str(arg):
     # We can change this so it is arg.value, or someway to be usable by field interface
-    _, dest = str(arg).split(".")
-    return dest
+    return str(arg)
 
 
 def namespace_to_dict(args_ns):
@@ -110,6 +112,7 @@ def unserializable_dict(args_str):
 
 def add_argument(parser, arg, **kwargs):
     short_name, long_name = CMD_STR[arg]
+    print(f"{arg = }")
     dest = arg_to_str(arg)
     parser.add_argument(short_name, long_name, dest=dest, **kwargs)
 

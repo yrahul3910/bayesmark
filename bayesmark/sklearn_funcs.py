@@ -30,9 +30,17 @@ the `search_param_api_dict`.
 import os.path
 import pickle as pkl
 import warnings
+
 from abc import ABC, abstractmethod
 
+from bayesmark.constants import ARG_DELIM, METRICS, MODEL_NAMES, VISIBLE_TO_OPT
+from bayesmark.data import METRICS_LOOKUP, ProblemType, get_problem_type, load_data
+from bayesmark.path_util import absopen
+from bayesmark.space import JointSpace
+from bayesmark.util import str_join_safe
+
 import numpy as np
+
 from sklearn.ensemble import AdaBoostClassifier, AdaBoostRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.linear_model import Lasso, LogisticRegression, Ridge
 from sklearn.metrics import get_scorer
@@ -42,11 +50,6 @@ from sklearn.neural_network import MLPClassifier, MLPRegressor
 from sklearn.svm import SVC, SVR
 from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
-from bayesmark.constants import ARG_DELIM, METRICS, MODEL_NAMES, VISIBLE_TO_OPT
-from bayesmark.data import METRICS_LOOKUP, ProblemType, get_problem_type, load_data
-from bayesmark.path_util import absopen
-from bayesmark.space import JointSpace
-from bayesmark.util import str_join_safe
 
 # Using 3 would be faster, but 5 is the most realistic CV split (5-fold)
 CV_SPLITS = 5
@@ -349,7 +352,8 @@ class SklearnModel(TestFunction):
         # Unbox to basic float to keep it simple
         cv_loss = cv_loss.item()
         assert isinstance(cv_loss, float)
-        generalization_loss = generalization_loss.item()
+        if not isinstance(generalization_loss, float):
+            generalization_loss = generalization_loss.item()
         assert isinstance(generalization_loss, float)
 
         # For now, score with same objective. We can later add generalization error
